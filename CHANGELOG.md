@@ -2,6 +2,7 @@
 
 # ??
 * Reduce `a <=? Max a b` to `True`
+* Reduce `n ~ (Max a b) => a <=? n` to `True`
 
 # 0.3 *September 14th 2018*
 * Move `KnownNat2` instances for GHC 8.4's `Div` and `Mod` from `ghc-typelits-extra` to `ghc-typelits-knownnat`
