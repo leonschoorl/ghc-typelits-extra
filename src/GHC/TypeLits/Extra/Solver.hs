@@ -57,6 +57,7 @@ import TcTypeNats (typeNatTyCons)
 import GHC.TypeLits.Extra.Solver.Operations
 import GHC.TypeLits.Extra.Solver.Unify
 
+
 -- | A solver implement as a type-checker plugin for:
 --
 --     * 'Div': type-level 'div'
@@ -152,10 +153,16 @@ simplifyExtra eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] eqs
         -- transform:  q ~ Max x y => (p <=? q ~ True)
         -- to:         (p <=? Max x y) ~ True
         -- and try to solve that along with the rest of the eqs'
+
+        -- problem since GHC-8.4, ghc generates an extra level of indirection
+        -- (r ~ Max x y, r ~ q) => (p <=? q ~ True)
         (p, q@(V _))
-          | b -> case findMax q eqs of
-                   Just m  -> simples evs ((Right (ct,p,m,b)):eqs')
-                   Nothing -> simples evs eqs'
+          --  | b -> case findMax q eqs of
+          --          Just m  -> shout (unlines ["findMax: ","q: " ++ show q,"eqs:", unlines $ show <$> eqs, "found m=" ++ show m]) simples evs ((Right (ct,p,m,b)):eqs')
+          --          Nothing -> shout (unlines ["findMax: ",show q,show eqs, "not found"]) simples evs eqs'
+          | b
+          , Just m <- findMax q eqs
+          -> simples evs ((Right (ct,p,m,b)):eqs')
         _ -> simples evs eqs'
 
     -- look for given constraint with the form: c ~ Max x y
@@ -167,6 +174,12 @@ simplifyExtra eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] eqs
           | c == a && not (isWantedCt ct)
             = Just b
         go ((ct, a@(Max _ _),b) :_)
+          | c == b && not (isWantedCt ct)
+            = Just a
+        go ((ct, a,b) :_)
+          | c == a && not (isWantedCt ct)
+            = Just b
+        go ((ct, a,b) :_)
           | c == b && not (isWantedCt ct)
             = Just a
         go (_:rest) = go rest
