@@ -57,6 +57,8 @@ import TcTypeNats (typeNatTyCons)
 import GHC.TypeLits.Extra.Solver.Operations
 import GHC.TypeLits.Extra.Solver.Unify
 
+import Debug.Trace
+import Outputable
 
 -- | A solver implement as a type-checker plugin for:
 --
@@ -127,6 +129,12 @@ instance Outputable SimplifyResult where
   ppr (Simplified evs) = text "Simplified" $$ ppr evs
   ppr (Impossible eq)  = text "Impossible" <+> ppr eq
 
+shout :: String -> a -> a
+shout msg = trace (unlines [line,msg,line])
+  where line = replicate 40 '='
+ppr' :: Outputable a => a -> String
+ppr' = showSDocUnsafe . ppr
+
 simplifyExtra :: [Either NatEquality NatInEquality] -> TcPluginM SimplifyResult
 simplifyExtra eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] eqs
   where
@@ -149,6 +157,7 @@ simplifyExtra eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] eqs
           | otherwise     -> return  (Impossible eq)
         (p, Max x y)
           | b && (p == x || p == y) -> simples (((,) <$> evMagic ct <*> pure ct):evs) eqs'
+          | b && solveMax p x y -> simples (((,) <$> evMagic ct <*> pure ct):evs) eqs'
 
         -- transform:  q ~ Max x y => (p <=? q ~ True)
         -- to:         (p <=? Max x y) ~ True
@@ -163,8 +172,16 @@ simplifyExtra eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] eqs
           | b
           , Just m <- findMax q eqs
           -> simples evs ((Right (ct,p,m,b)):eqs')
-        _ -> simples evs eqs'
+        (p, q@(C _)) -> shout ("Don't known C what to do with: " ++ ppr' p ++ " <=? " ++ ppr' q) simples evs eqs'
+        _ -> shout ("Don't known what to do with: " ++ ppr' u ++ " <=? " ++ ppr' v) simples evs eqs'
 
+    -- | solveMax p x y returns True when p <= Max x y
+    solveMax :: ExtraOp -> ExtraOp -> ExtraOp -> Bool
+    solveMax (Max p1 p2) x y | shout "try solveMax met Max on LHS" solveMax p1 x y && solveMax p2 x y = True
+    solveMax p (Max x1 x2) _ | solveMax p x1 x2 = True
+    solveMax p _ (Max y1 y2) | solveMax p y1 y2 = True
+    solveMax p x y           | p == x || p == y = True
+    solveMax _ _ _ = False
     -- look for given constraint with the form: c ~ Max x y
     findMax :: ExtraOp -> [Either NatEquality NatInEquality] -> Maybe ExtraOp
     findMax c = go . lefts
