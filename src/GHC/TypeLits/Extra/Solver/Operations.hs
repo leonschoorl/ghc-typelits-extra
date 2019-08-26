@@ -22,6 +22,7 @@ module GHC.TypeLits.Extra.Solver.Operations
   , mergeGCD
   , mergeLCM
   , mergeExp
+  , elimMax
   )
 where
 
@@ -117,14 +118,31 @@ mergeMax defs x y =
       z  = fst (runWriter (normaliseNat (mkTyConApp typeNatSubTyCon [y',x'])))
 #if MIN_VERSION_ghc_typelits_natnormalise(0,7,0)
   in  case runWriterT (isNatural z) of
-        Just (True , cs) | Set.null cs -> y
-        Just (False, cs) | Set.null cs -> x
+        -- Just (True , cs) | Set.null cs -> y
+        -- Just (False, cs) | Set.null cs -> x
 #else
   in  case isNatural z of
-        Just True  -> y
-        Just False -> x
+        -- Just True  -> y
+        -- Just False -> x
 #endif
         _ -> Max x y
+
+elimMax :: ExtraDefs -> ExtraOp -> ExtraOp -> Maybe ExtraOp
+elimMax defs x y =
+  let x' = reifyEOP defs x
+      y' = reifyEOP defs y
+      z  = fst (runWriter (normaliseNat (mkTyConApp typeNatSubTyCon [y',x'])))
+#if MIN_VERSION_ghc_typelits_natnormalise(0,7,0)
+  in  case runWriterT (isNatural z) of
+        Just (True , cs) | Set.null cs -> Just y
+        Just (False, cs) | Set.null cs -> Just x
+#else
+  in  case isNatural z of
+        Just True  -> Just y
+        Just False -> Just x
+#endif
+        _ -> Nothing
+
 
 mergeMin :: ExtraDefs -> ExtraOp -> ExtraOp -> ExtraOp
 mergeMin defs x y =

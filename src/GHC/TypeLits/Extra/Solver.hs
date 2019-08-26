@@ -26,14 +26,16 @@ where
 import Control.Monad.Trans.Maybe (MaybeT (..))
 import Data.Either               (lefts)
 import Data.Maybe                (catMaybes)
+import Data.Set                  (empty)
 import GHC.TcPluginM.Extra       (evByFiat, lookupModule, lookupName,
                                   tracePlugin)
+import qualified GHC.TypeLits.Normalise as Normalise
 
 -- GHC API
 import FastString (fsLit)
 import Module     (mkModuleName)
 import OccName    (mkTcOcc)
-import Outputable (Outputable (..), (<+>), ($$), text)
+import Outputable (Outputable (..), (<+>), ($$), showSDocUnsafe, text)
 import Plugins    (Plugin (..), defaultPlugin)
 #if MIN_VERSION_ghc(8,6,0)
 import Plugins    (purePlugin)
@@ -43,10 +45,10 @@ import TcPluginM  (TcPluginM, tcLookupTyCon, tcPluginTrace)
 import TcRnTypes  (Ct, TcPlugin(..), TcPluginResult (..), ctEvidence, ctEvPred,
                    isWantedCt)
 import TcType      (typeKind)
-import Type       (EqRel (NomEq), Kind, PredTree (EqPred), classifyPredType,
-                   eqType)
+import Type       (EqRel (NomEq), Kind, PredTree (EqPred), PredType, classifyPredType,
+                   eqType, mkPrimEqPred, mkTyConApp)
 import TyCoRep    (Type (..))
-import TysWiredIn (typeNatKind, promotedTrueDataCon, promotedFalseDataCon)
+import TysWiredIn (boolTy, typeNatKind, promotedTrueDataCon, promotedFalseDataCon)
 import TcTypeNats (typeNatLeqTyCon)
 #if MIN_VERSION_ghc(8,4,0)
 import GHC.TcPluginM.Extra (flattenGivens)
@@ -59,6 +61,9 @@ import Control.Monad ((<=<))
 -- internal
 import GHC.TypeLits.Extra.Solver.Operations
 import GHC.TypeLits.Extra.Solver.Unify
+
+
+import GHC.Stack
 
 -- | A solver implement as a type-checker plugin for:
 --
@@ -116,54 +121,79 @@ decideEqualSOP defs givens  _deriveds wanteds = do
 #else
       unit_givens <- catMaybes <$> mapM ((runMaybeT . toNatEquality defs) <=< zonkCt) givens
 #endif
-      sr <- simplifyExtra (unit_givens ++ unit_wanteds)
+      sr <- simplifyExtra defs (unit_givens ++ unit_wanteds)
       tcPluginTrace "normalised" (ppr sr)
       case sr of
-        Simplified evs -> return (TcPluginOk (filter (isWantedCt . snd) evs) [])
+        Simplified evs newWanted -> return (TcPluginOk (filter (isWantedCt . snd) evs) newWanted)
         Impossible eq  -> return (TcPluginContradiction [fromNatEquality eq])
 
 type NatEquality   = (Ct,ExtraOp,ExtraOp)
 type NatInEquality = (Ct,ExtraOp,ExtraOp,Bool)
 
 data SimplifyResult
-  = Simplified [(EvTerm,Ct)]
+  = Simplified [(EvTerm,Ct)] [Ct]
   | Impossible (Either NatEquality NatInEquality)
 
 instance Outputable SimplifyResult where
-  ppr (Simplified evs) = text "Simplified" $$ ppr evs
+  ppr (Simplified evs newWanted) = text "Simplified" $$ ppr evs $$ ppr newWanted
   ppr (Impossible eq)  = text "Impossible" <+> ppr eq
 
-simplifyExtra :: [Either NatEquality NatInEquality] -> TcPluginM SimplifyResult
-simplifyExtra eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] eqs
+simplifyExtra :: ExtraDefs -> [Either NatEquality NatInEquality] -> TcPluginM SimplifyResult
+simplifyExtra defs eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] [] eqs
   where
-    simples :: [Maybe (EvTerm, Ct)] -> [Either NatEquality NatInEquality] -> TcPluginM SimplifyResult
-    simples evs [] = return (Simplified (catMaybes evs))
-    simples evs (eq@(Left (ct,u,v)):eqs') = do
+    simples :: [Maybe (EvTerm, Ct)] -> [Ct] -> [Either NatEquality NatInEquality] -> TcPluginM SimplifyResult
+    simples evs newWanted [] = return (Simplified (catMaybes evs) newWanted)
+    simples evs newWanted (eq@(Left (ct,u,v)):eqs') = do
       ur <- unifyExtra ct u v
       tcPluginTrace "unifyExtra result" (ppr ur)
       case ur of
-        Win  -> simples (((,) <$> evMagic ct <*> pure ct):evs) eqs'
+        Win  -> simples (((,) <$> evMagic ct <*> pure ct):evs) newWanted eqs'
         Lose -> if null evs && null eqs'
                    then return  (Impossible eq)
-                   else simples evs eqs'
-        Draw -> simples evs eqs'
-    simples evs (eq@(Right (ct,u,v,b)):eqs') = do
+                   else simples evs newWanted eqs'
+        Draw -> simples evs newWanted eqs'
+    simples evs newWanted (eq@(Right (ct,u,v,b)):eqs') = do
       tcPluginTrace "unifyExtra leq result" (ppr (u,v,b))
       case (u,v) of
         (I i,I j)
-          | (i <= j) == b -> simples (((,) <$> evMagic ct <*> pure ct):evs) eqs'
+          | (i <= j) == b -> simples (((,) <$> evMagic ct <*> pure ct):evs) newWanted eqs'
           | otherwise     -> return  (Impossible eq)
         (p, Max x y)
-          | b && (p == x || p == y) -> simples (((,) <$> evMagic ct <*> pure ct):evs) eqs'
+          | b && (p == x || p == y) -> simples (((,) <$> evMagic ct <*> pure ct):evs) newWanted eqs'
 
         -- transform:  q ~ Max x y => (p <=? q ~ True)
         -- to:         (p <=? Max x y) ~ True
         -- and try to solve that along with the rest of the eqs'
         (p, q@(V _))
           | b -> case findMax q eqs of
-                   Just m  -> simples evs ((Right (ct,p,m,b)):eqs')
-                   Nothing -> simples evs eqs'
-        _ -> simples evs eqs'
+                   Just m  -> do
+                     -- tcPluginTrace "new wanted?" (ppr (ct))
+                     -- tcPluginTrace "new wanted2" (ppr (p,m,b))
+                     -- _ <- error "new wanted"
+                     simples evs newWanted ((Right (ct,p,m,b)):eqs')
+                   Nothing -> simples evs newWanted eqs'
+        (p,q@(C _)) -> do
+          tcPluginTrace "Got C:" (ppr (p,q))
+          simples evs newWanted eqs'
+
+        (p, Max x y)
+          | Just biggest <- elimMax defs x y -> case biggest of
+              C _ -> do
+                let pred = ineqToPred defs p biggest b
+                Just ((evterm,ctout), newWanted') <- Normalise.evMagic ct empty [pred]
+                simples (Just (evterm,ctout):evs) (newWanted' ++ newWanted) eqs'
+              _ -> error ("elim max to: " ++ showSDocUnsafe (ppr biggest ))
+
+        (Max x y, p)
+          | Just biggest <- elimMax defs x y -> case biggest of
+              C _ -> do
+                let pred = ineqToPred defs biggest p b
+                Just ((evterm,ctout), newWanted') <- Normalise.evMagic ct empty [pred]
+                simples (Just (evterm,ctout):evs) (newWanted' ++ newWanted) eqs'
+              _ -> error ("elim max to: " ++ showSDocUnsafe (ppr biggest))
+
+
+        _ -> simples evs newWanted eqs'
 
     -- look for given constraint with the form: c ~ Max x y
     findMax :: ExtraOp -> [Either NatEquality NatInEquality] -> Maybe ExtraOp
@@ -178,6 +208,16 @@ simplifyExtra eqs = tcPluginTrace "simplifyExtra" (ppr eqs) >> simples [] eqs
             = Just a
         go (_:rest) = go rest
 
+ineqToPred :: ExtraDefs -> ExtraOp -> ExtraOp -> Bool -> (PredType,Kind)
+ineqToPred defs e1 e2 b = (mkPrimEqPred ineq res,boolTy)
+  where
+    ty1 = reifyEOP defs e1
+    ty2 = reifyEOP defs e2
+    ineq = mkTyConApp typeNatLeqTyCon [ty1,ty2]
+    res = mkTyConApp tc []
+      where tc = case b of
+              True  -> promotedTrueDataCon
+              False -> promotedFalseDataCon
 
 -- Extract the Nat equality constraints
 toNatEquality :: ExtraDefs -> Ct -> MaybeT TcPluginM (Either NatEquality NatInEquality)
